@@ -1958,6 +1958,80 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(response.usage.total_tokens, 2073)
         self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
 
+    def test_kimi_k3_usage_caps_cached_tokens_at_reported_prompt_tokens(self):
+        enter_override(
+            self, get_context().override_server_args(enable_cache_report=True)
+        )
+        self.chat.chat_encoding_spec = "kimi_k3"
+        for engine_prompt, engine_cached, reported_cached in (
+            (1025, 1024, 1022),  # whole prompt cached, stub included
+            (1050, 512, 512),  # partial hit stops before the stub
+            (1025, 0, 0),
+        ):
+            with self.subTest(engine_prompt=engine_prompt, engine_cached=engine_cached):
+                ret = [
+                    {
+                        "text": "Answer",
+                        "meta_info": {
+                            "id": "chatcmpl-kimi-k3-cached",
+                            "prompt_tokens": engine_prompt,
+                            "completion_tokens": 1,
+                            "cached_tokens": engine_cached,
+                            "finish_reason": {"type": "stop", "matched": None},
+                            "weight_version": "default",
+                        },
+                    }
+                ]
+
+                response = self.chat._build_chat_response(
+                    self.basic_req, ret, created=123
+                )
+
+                self.assertEqual(response.usage.prompt_tokens, engine_prompt - 3)
+                self.assertEqual(
+                    response.usage.prompt_tokens_details.cached_tokens,
+                    reported_cached,
+                )
+                self.assertEqual(
+                    self.chat._continuous_usage_cached_details(ret[0]).cached_tokens,
+                    reported_cached,
+                )
+
+    def test_kimi_k3_streaming_usage_caps_cached_tokens(self):
+        enter_override(
+            self, get_context().override_server_args(enable_cache_report=True)
+        )
+        self.chat.chat_encoding_spec = "kimi_k3"
+
+        async def generate():
+            yield {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-kimi-k3-cached-stream",
+                    "prompt_tokens": 1025,
+                    "completion_tokens": 1,
+                    "cached_tokens": 1024,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = generate()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        parsed = self._parse_chunks(self._run_chat_stream(Mock(), req))
+        usage = next(chunk["usage"] for chunk in parsed if chunk.get("usage"))
+
+        self.assertEqual(usage["prompt_tokens"], 1022)
+        self.assertEqual(usage["prompt_tokens_details"]["cached_tokens"], 1022)
+
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True
